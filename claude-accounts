@@ -25,6 +25,7 @@ Usage:
   claude-accounts uninstall          undo install (account slots and logins stay)
   claude-accounts token <label>      make a Conductor token for that slot (once)
   claude-accounts conductor on|off   make Conductor follow the active account
+  claude-accounts menubar install    usage and switching in the menu bar (SwiftBar)
 
 Why failover and not pooling: requests stay on one account until it is actually
 out of quota, exactly as if you had run /login by hand. Nothing spreads load
@@ -496,7 +497,7 @@ def cmd_status(args) -> int:
             rows.append({"label": label, "active": label == cur, "identity": identity(label),
                          "token": token_present(label), "usage": u})
         save_state(state)
-        print(json.dumps({"active": cur, "accounts": rows}))
+        print(json.dumps({"active": cur, "conductor": conductor_wired(), "accounts": rows}))
         return 0
     for label in labels():
         u = usage(label, state, force=args.refresh)
@@ -745,6 +746,9 @@ def cmd_install(args) -> int:
     if (here / "claude-conductor").resolve() != CONDUCTOR_WRAPPER.resolve():
         shutil.copy2(here / "claude-conductor", CONDUCTOR_WRAPPER)
     os.chmod(CONDUCTOR_WRAPPER, 0o755)
+    plugin = here / "menubar" / MENUBAR_PLUGIN
+    if plugin.is_file() and plugin.resolve() != MENUBAR_SOURCE.resolve():
+        shutil.copy2(plugin, MENUBAR_SOURCE)
     cli = WRAPPER.parent / "claude-accounts"
     if Path(__file__).resolve() != cli.resolve():
         shutil.copy2(Path(__file__).resolve(), cli)
@@ -771,6 +775,8 @@ def cmd_install(args) -> int:
 
 
 def cmd_uninstall(args) -> int:
+    if menubar_remove():
+        print("menu bar plugin removed")
     uid = os.getuid()
     subprocess.run(["launchctl", "bootout", f"gui/{uid}/{AGENT_LABEL}"], capture_output=True)
     AGENT_PLIST.unlink(missing_ok=True)
@@ -782,7 +788,7 @@ def cmd_uninstall(args) -> int:
     link = HOME / ".local" / "bin" / "claude-accounts"
     if link.is_symlink():
         link.unlink()
-    for f in (WRAPPER, CONDUCTOR_WRAPPER, WRAPPER.parent / "claude-accounts"):
+    for f in (WRAPPER, CONDUCTOR_WRAPPER, WRAPPER.parent / "claude-accounts", MENUBAR_SOURCE):
         f.unlink(missing_ok=True)
     print(f"removed the wrappers. Account slots and their logins are still in {ROOT};\n"
           f"delete that folder and run `claude auth logout` in each slot to remove them too.\n"
@@ -850,6 +856,71 @@ def cmd_conductor(args) -> int:
     return 0
 
 
+MENUBAR_PLUGIN = "claude-accounts.3m.py"
+MENUBAR_SOURCE = ROOT / "bin" / "menubar-plugin.py"
+MENUBAR_CONFIG = ROOT / "menubar.json"
+SWIFTBAR_APP = Path("/Applications/SwiftBar.app")
+SWIFTBAR_DOMAIN = "com.ameba.SwiftBar"
+
+
+def swiftbar_plugin_dir() -> Path:
+    r = subprocess.run(["defaults", "read", SWIFTBAR_DOMAIN, "PluginDirectory"], capture_output=True, text=True)
+    if r.returncode == 0 and r.stdout.strip():
+        return Path(r.stdout.strip()).expanduser()
+    return HOME / "Library" / "Application Support" / "SwiftBar" / "Plugins"
+
+
+def menubar_remove() -> bool:
+    target = swiftbar_plugin_dir() / MENUBAR_PLUGIN
+    if not target.exists():
+        return False
+    target.unlink()
+    subprocess.run(["open", "-g", "swiftbar://refreshallplugins"], capture_output=True)
+    return True
+
+
+def cmd_menubar(args) -> int:
+    if args.action == "uninstall":
+        print("menu bar plugin removed" if menubar_remove() else "menu bar plugin was not installed")
+        return 0
+    if not MENUBAR_SOURCE.is_file():
+        sys.exit("run `claude-accounts install` first")
+    if args.codex_lb_ssh or args.codex_lb_url or args.codex_lb_api_key:
+        cfg = {}
+        if MENUBAR_CONFIG.is_file():
+            cfg = json.loads(MENUBAR_CONFIG.read_text())
+        for key in ("codex_lb_url", "codex_lb_api_key", "codex_lb_ssh", "codex_lb_container"):
+            value = getattr(args, key)
+            if value:
+                cfg[key] = value
+        if cfg.get("codex_lb_api_key") and not cfg.get("codex_lb_url") and not cfg.get("codex_lb_ssh"):
+            sys.exit("--codex-lb-api-key needs --codex-lb-url")
+        fd = os.open(MENUBAR_CONFIG, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            json.dump(cfg, f, indent=1)
+        os.chmod(MENUBAR_CONFIG, 0o600)
+        print(f"codex-lb settings saved to {MENUBAR_CONFIG}")
+    if not SWIFTBAR_APP.exists():
+        if not shutil.which("brew"):
+            sys.exit("SwiftBar is needed for the menu bar. Install it from https://swiftbar.app, then rerun this.")
+        print("installing SwiftBar with Homebrew")
+        if subprocess.call(["brew", "install", "--cask", "swiftbar"]) != 0:
+            sys.exit("SwiftBar install failed")
+    plugins = swiftbar_plugin_dir()
+    plugins.mkdir(parents=True, exist_ok=True)
+    # Pin the interpreter: SwiftBar's PATH can resolve python3 to Apple's stub.
+    body = MENUBAR_SOURCE.read_text().split("\n", 1)[1]
+    target = plugins / MENUBAR_PLUGIN
+    target.write_text(f"#!{sys.executable}\n" + body)
+    os.chmod(target, 0o755)
+    # Set the folder before SwiftBar's first launch so it doesn't ask for one.
+    subprocess.run(["defaults", "write", SWIFTBAR_DOMAIN, "PluginDirectory", str(plugins)], capture_output=True)
+    subprocess.run(["open", "-a", "SwiftBar"], capture_output=True)
+    subprocess.run(["open", "-g", "swiftbar://refreshallplugins"], capture_output=True)
+    print(f"menu bar plugin installed: {target}")
+    return 0
+
+
 def main() -> int:
     p = argparse.ArgumentParser(prog="claude-accounts", description=__doc__.split("\n")[0])
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -871,6 +942,13 @@ def main() -> int:
     a = sub.add_parser("install"); a.add_argument("--no-agent", action="store_true")
     a.set_defaults(fn=cmd_install)
     a = sub.add_parser("uninstall"); a.set_defaults(fn=cmd_uninstall)
+    a = sub.add_parser("menubar", help="usage and switching in the menu bar (SwiftBar)")
+    a.add_argument("action", choices=["install", "uninstall"])
+    a.add_argument("--codex-lb-url", help="codex-lb base URL, e.g. http://host:2455")
+    a.add_argument("--codex-lb-api-key", help="codex-lb API key (sk-clb-...): shows the pool's combined usage")
+    a.add_argument("--codex-lb-ssh", help="user@host running codex-lb in Docker: shows every account")
+    a.add_argument("--codex-lb-container", help="codex-lb container name (default codex-lb)")
+    a.set_defaults(fn=cmd_menubar)
     args = p.parse_args()
     return args.fn(args)
 

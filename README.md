@@ -22,6 +22,7 @@ left. It does what running `/login` by hand would do, automatically.
 - macOS (logins are read from the macOS Keychain)
 - [Claude Code](https://docs.anthropic.com/en/docs/claude-code) on your `PATH`
 - `python3` (included with the Xcode Command Line Tools)
+- For the menu bar: [SwiftBar](https://swiftbar.app), installed for you if you have Homebrew
 
 ## Install
 
@@ -91,6 +92,33 @@ in `~/.conductor/settings.toml` after backing up the file. New Conductor chats
 use the active account. A slot without a token falls back to the `default`
 login, so failover ranks token-less slots last while Conductor is connected.
 
+## Menu bar
+
+```bash
+claude-accounts menubar install
+```
+
+This adds a [SwiftBar](https://swiftbar.app) menu, installing SwiftBar with
+Homebrew if it's missing. The title shows the active account's highest usage.
+The menu shows every account's session and weekly bars with reset times, a
+one-click **Switch Claude to …** for each account, **Refresh now**, and the
+failover log. It refreshes every 3 minutes.
+
+It can also show Codex usage from [codex-lb](https://github.com/Soju06/codex-lb),
+in one of two ways:
+
+```bash
+# The pool's combined usage, over codex-lb's API
+claude-accounts menubar install --codex-lb-url http://host:2455 --codex-lb-api-key sk-clb-...
+
+# Every pooled account, read from codex-lb's database over SSH
+# (codex-lb running in Docker on a host you can SSH into without a password)
+claude-accounts menubar install --codex-lb-ssh user@host --codex-lb-url http://host:2455
+```
+
+Settings are saved to `~/.claude-accounts/menubar.json`, readable only by you.
+To remove the menu, run `claude-accounts menubar uninstall`.
+
 ## Day to day
 
 ```bash
@@ -144,7 +172,7 @@ used up is never picked.
 claude-accounts uninstall
 ```
 
-This removes the agent and the wrappers, and switches CCodex and Conductor back
+This removes the agent, the wrappers and the menu bar plugin, and switches CCodex and Conductor back
 to their own Claude Code. Account slots stay in `~/.claude-accounts`. Delete
 that folder to remove them, after running `claude auth logout` in each slot.
 
