@@ -1,0 +1,47 @@
+#!/bin/sh
+# Runs Claude Code on the active account. It reads the label from
+# ~/.claude-accounts/ACTIVE, points CLAUDE_CONFIG_DIR at that slot, and execs
+# the real Claude Code. Only the login changes.
+#
+# Which Claude Code it runs, in order:
+#   1. $CLAUDE_ACCOUNTS_REAL, if set
+#   2. CCodex's own pinned copy, so CCodex's version check still passes
+#   3. the first `claude` on PATH that is not this wrapper
+set -eu
+ROOT="$HOME/.claude-accounts"
+label=$(cat "$ROOT/ACTIVE" 2>/dev/null || echo default)
+if [ "$label" = default ] || [ ! -d "$ROOT/$label" ]; then
+  unset CLAUDE_CONFIG_DIR
+else
+  CLAUDE_CONFIG_DIR="$ROOT/$label"
+  export CLAUDE_CONFIG_DIR
+fi
+# Subscription login only; an inherited API key would switch billing to the API.
+unset ANTHROPIC_API_KEY
+
+real="${CLAUDE_ACCOUNTS_REAL:-}"
+if [ -z "$real" ]; then
+  for candidate in "$HOME"/.ccodex/current/node_modules/@anthropic-ai/claude-agent-sdk-*/claude; do
+    [ -x "$candidate" ] && real=$candidate && break
+  done
+fi
+if [ -z "$real" ]; then
+  self=$(cd "$(dirname "$0")" && pwd -P)/$(basename "$0")
+  old_ifs=$IFS
+  IFS=:
+  for dir in $PATH; do
+    candidate="$dir/claude"
+    [ -x "$candidate" ] || continue
+    resolved=$(cd "$(dirname "$candidate")" && pwd -P)/claude
+    if [ "$resolved" != "$self" ] && [ "$(readlink "$candidate" 2>/dev/null || true)" != "$self" ]; then
+      real=$candidate
+      break
+    fi
+  done
+  IFS=$old_ifs
+fi
+if [ -z "$real" ] || [ ! -x "$real" ]; then
+  echo "claude-accounts: Claude Code not found. Install it, or set CLAUDE_ACCOUNTS_REAL." >&2
+  exit 69
+fi
+exec "$real" "$@"

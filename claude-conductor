@@ -1,0 +1,31 @@
+#!/bin/sh
+# Conductor runs this as claude_code_executable_path. Unlike the CCodex
+# wrapper it never changes CLAUDE_CONFIG_DIR: Conductor mirrors transcripts out
+# of ~/.claude and drops frames from any other config dir. It switches accounts
+# with the slot's long-lived token instead, and falls back to the normal
+# ~/.claude login whenever the active slot has none.
+ROOT="$HOME/.claude-accounts"
+label=$(cat "$ROOT/ACTIVE" 2>/dev/null || echo default)
+if [ "$label" != default ]; then
+  token=$(security find-generic-password -s claude-accounts-token -a "$label" -w 2>/dev/null || true)
+  if [ -n "$token" ]; then
+    CLAUDE_CODE_OAUTH_TOKEN=$token
+    export CLAUDE_CODE_OAUTH_TOKEN
+    unset CLAUDE_CODE_OAUTH_SCOPES
+    # Subscription login only; an inherited API key would switch billing to the API.
+    unset ANTHROPIC_API_KEY
+  fi
+fi
+
+# Conductor's own bundled Claude Code, newest version it has downloaded.
+real="${CLAUDE_ACCOUNTS_CONDUCTOR_REAL:-}"
+if [ -z "$real" ]; then
+  base="$HOME/Library/Application Support/com.conductor.app/agent-binaries/claude"
+  version=$(ls "$base" 2>/dev/null | sort -t. -k1,1n -k2,2n -k3,3n | tail -1)
+  real="$base/$version/claude"
+fi
+if [ ! -x "$real" ]; then
+  echo "claude-conductor: Conductor's bundled Claude Code not found" >&2
+  exit 69
+fi
+exec "$real" "$@"

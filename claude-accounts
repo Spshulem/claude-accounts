@@ -1,0 +1,879 @@
+#!/usr/bin/env python3
+"""claude-accounts - keep several Claude subscriptions logged in and fail over between them.
+
+Each account is a normal, officially-logged-in Claude Code config dir. Switching
+accounts only changes which dir the next Claude process uses; nothing is logged
+out, and no token is ever copied, refreshed, or proxied by this tool.
+
+  ~/.claude                    the "default" account (CLAUDE_CONFIG_DIR unset)
+  ~/.claude-accounts/<label>/  one dir per extra account. Everything in ~/.claude
+                               is symlinked in (settings, skills, agents, plugins,
+                               transcripts) so every account behaves identically
+                               and a conversation can continue after a switch.
+                               Only the login differs.
+  ~/.claude-accounts/ACTIVE    the active account's label
+  ~/.claude-accounts/bin/claude  wrapper that runs Claude Code on the active
+                               account (for the CLI, CCodex and Conductor)
+
+Usage:
+  claude-accounts add <label>        create an account slot
+  claude-accounts login <label>      log that slot in (interactive, once)
+  claude-accounts status             usage for every account
+  claude-accounts use <label>        make it active (--now: move running Claude chats too)
+  claude-accounts auto               switch away from an exhausted active account
+  claude-accounts install            install the wrapper and the failover agent
+  claude-accounts uninstall          undo install (account slots and logins stay)
+  claude-accounts token <label>      make a Conductor token for that slot (once)
+  claude-accounts conductor on|off   make Conductor follow the active account
+
+Why failover and not pooling: requests stay on one account until it is actually
+out of quota, exactly as if you had run /login by hand. Nothing spreads load
+across accounts.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import platform
+import re
+import shutil
+import ssl
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from datetime import datetime
+from pathlib import Path
+
+HOME = Path.home()
+DEFAULT_DIR = HOME / ".claude"
+ROOT = HOME / ".claude-accounts"
+ACTIVE_FILE = ROOT / "ACTIVE"
+STATE_FILE = ROOT / "state.json"
+LOG_FILE = ROOT / "auto.log"
+WRAPPER = ROOT / "bin" / "claude"
+CCODEX_CONFIG = HOME / ".ccodex" / "config.toml"
+CCODEX_CODEX = HOME / ".ccodex" / "bin" / "codex"
+CONDUCTOR_WRAPPER = ROOT / "bin" / "claude-conductor"
+CONDUCTOR_SETTINGS = HOME / ".conductor" / "settings.toml"
+# Long-lived subscription tokens from `claude setup-token`, one Keychain item
+# per slot. Conductor needs these: it mirrors transcripts out of ~/.claude, so
+# its Claude must keep that config dir and switch accounts by token instead.
+TOKEN_SERVICE = "claude-accounts-token"
+TOKEN_RE = re.compile(rb"sk-ant-oat01-[A-Za-z0-9_-]{20,}")
+
+USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+# The usage endpoint rate-limits hard; never poll one account faster than this.
+POLL_FLOOR_S = 180
+# Switch away from the active account at these percents. The 5-hour session
+# window can burn several percent between checks, so it switches earlier;
+# weekly windows are worth spending closer to the end.
+SESSION_SWITCH_AT = 90.0
+WEEKLY_SWITCH_AT = 97.0
+
+# Never share these into an account dir: they are the login and identity.
+# .claude.json matters most: ~/.claude can carry its own copy, and sharing it
+# would make every slot write its oauthAccount into one file.
+PRIVATE_PREFIXES = (".credentials.json", ".claude.json")
+
+
+# ------------------------------------------------------------------ accounts
+
+def account_dir(label: str) -> Path:
+    return DEFAULT_DIR if label == "default" else ROOT / label
+
+
+def labels() -> list[str]:
+    out = ["default"]
+    if ROOT.is_dir():
+        out += sorted(p.name for p in ROOT.iterdir()
+                      if p.is_dir() and p.name not in {"bin"} and not p.name.startswith("."))
+    return out
+
+
+def active() -> str:
+    try:
+        label = ACTIVE_FILE.read_text().strip()
+    except FileNotFoundError:
+        return "default"
+    return label if label in labels() else "default"
+
+
+def claude_env(label: str) -> dict:
+    env = dict(os.environ)
+    if label == "default":
+        env.pop("CLAUDE_CONFIG_DIR", None)
+    else:
+        env["CLAUDE_CONFIG_DIR"] = str(account_dir(label))
+    return env
+
+
+def keychain_service(label: str) -> str:
+    # Claude Code names the Keychain item after the config dir: unset -> plain
+    # name, set -> suffixed with the first 8 hex of sha256(dir).
+    if label == "default":
+        return "Claude Code-credentials"
+    digest = hashlib.sha256(str(account_dir(label)).encode()).hexdigest()[:8]
+    return f"Claude Code-credentials-{digest}"
+
+
+def read_credentials(label: str) -> dict | None:
+    """Read-only. Never refreshes or rewrites a token.
+
+    On macOS the Keychain is authoritative; a leftover .credentials.json there
+    is usually stale, so it is only a fallback.
+    """
+    if platform.system() == "Darwin":
+        r = subprocess.run(["security", "find-generic-password", "-s", keychain_service(label), "-w"],
+                           capture_output=True, text=True, timeout=15)
+        if r.returncode == 0:
+            try:
+                return json.loads(r.stdout)
+            except Exception:
+                pass
+    f = account_dir(label) / ".credentials.json"
+    if f.is_file() and not f.is_symlink():
+        try:
+            return json.loads(f.read_text())
+        except Exception:
+            return None
+    return None
+
+
+def identity(label: str) -> str | None:
+    cfg = HOME / ".claude.json" if label == "default" else account_dir(label) / ".claude.json"
+    try:
+        acct = json.loads(cfg.read_text()).get("oauthAccount") or {}
+    except Exception:
+        return None
+    email = acct.get("emailAddress")
+    if not email:
+        return None
+    # One email can belong to several organizations, each with its own quota.
+    org = acct.get("organizationName") or ""
+    if org and org != f"{email}'s Organization":
+        return f"{email} [{org}]"
+    return email
+
+
+# --------------------------------------------------------------------- usage
+
+def ssl_context() -> ssl.SSLContext:
+    # Framework Python on macOS ships no CA bundle.
+    try:
+        import certifi
+        return ssl.create_default_context(cafile=certifi.where())
+    except Exception:
+        pass
+    for path in ("/etc/ssl/cert.pem", "/private/etc/ssl/cert.pem", "/etc/ssl/certs/ca-certificates.crt"):
+        if os.path.exists(path):
+            try:
+                return ssl.create_default_context(cafile=path)
+            except Exception:
+                continue
+    return ssl.create_default_context()
+
+
+def claude_version() -> str:
+    try:
+        r = subprocess.run(["claude", "--version"], capture_output=True, text=True, timeout=15)
+        m = re.search(r"(\d+\.\d+\.\d+)", r.stdout)
+        if m:
+            return m.group(1)
+    except Exception:
+        pass
+    return "2.1.280"
+
+
+def load_state() -> dict:
+    try:
+        return json.loads(STATE_FILE.read_text())
+    except Exception:
+        return {}
+
+
+def save_state(state: dict) -> None:
+    ROOT.mkdir(mode=0o700, exist_ok=True)
+    tmp = STATE_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(state, indent=1))
+    tmp.replace(STATE_FILE)
+
+
+def fetch_usage(label: str) -> dict:
+    blob = read_credentials(label)
+    if not blob:
+        return {"ok": False, "error": "not logged in"}
+    oauth = blob.get("claudeAiOauth") or blob
+    token, expires = oauth.get("accessToken"), oauth.get("expiresAt")
+    if not token:
+        return {"ok": False, "error": "not logged in"}
+    if expires and time.time() * 1000 > expires:
+        # Refreshing here could invalidate the refresh token Claude Code holds.
+        # Claude Code refreshes it itself the next time the account is used.
+        return {"ok": False, "error": "idle (token refreshes on next use)"}
+    req = urllib.request.Request(USAGE_URL, headers={
+        "Authorization": f"Bearer {token}",
+        "User-Agent": f"claude-code/{claude_version()}",
+        "anthropic-beta": "oauth-2025-04-20",
+        "Accept": "application/json",
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=20, context=ssl_context()) as r:
+            data = json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        return {"ok": False, "error": f"HTTP {e.code}"}
+    except Exception as e:
+        return {"ok": False, "error": type(e).__name__}
+
+    windows = []
+    for lim in data.get("limits") or []:
+        kind = lim.get("kind") or ""
+        model = ((lim.get("scope") or {}).get("model") or {}).get("display_name")
+        name = {"session": "session", "weekly_all": "weekly"}.get(kind, kind)
+        if kind == "weekly_scoped":
+            if not model or "all models" in model.lower():
+                continue
+            name = f"weekly:{model}"
+        windows.append({"name": name, "pct": lim.get("percent"), "resets_at": lim.get("resets_at")})
+    if not windows:
+        for key, name in (("five_hour", "session"), ("seven_day", "weekly")):
+            blk = data.get(key)
+            if blk:
+                windows.append({"name": name, "pct": blk.get("utilization"),
+                                "resets_at": blk.get("resets_at")})
+    return {"ok": True, "windows": windows}
+
+
+KEEPALIVE_EVERY_S = 1800
+
+
+def keepalive(label: str, state: dict) -> bool:
+    """Let Claude Code refresh an idle login by using it once.
+
+    A slot that only serves Conductor (via its setup-token) never uses its own
+    login, so the access token expires after ~8h and usage becomes unreadable:
+    failover goes blind exactly when it matters. One tiny Haiku prompt makes
+    Claude Code refresh and save the login itself. Nothing is persisted, and no
+    user settings, hooks or MCP servers load. Rate-limited per slot.
+    """
+    stamp = state.setdefault("_keepalive", {})
+    if time.time() - stamp.get(label, 0) < KEEPALIVE_EVERY_S:
+        return False
+    stamp[label] = time.time()
+    env = claude_env(label)
+    env.pop("ANTHROPIC_API_KEY", None)
+    env.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
+    try:
+        r = subprocess.run(
+            ["claude", "-p", "Reply with: ok", "--model", "haiku", "--no-session-persistence",
+             "--strict-mcp-config", "--setting-sources", "project"],
+            env=env, cwd="/tmp", capture_output=True, text=True, timeout=120)
+        log(f"keepalive {label}: exit {r.returncode}")
+        return r.returncode == 0
+    except Exception as e:
+        log(f"keepalive {label}: {type(e).__name__}")
+        return False
+
+
+def still_limited(reading: dict) -> dict | None:
+    """Carry a failed read forward from the last good one.
+
+    Windows whose reset time has passed are dropped (they are no longer
+    limiting); anything still before its reset keeps its old percent, so an
+    account known to be exhausted is never picked just because a read failed.
+    """
+    now = time.time()
+    kept = []
+    for w in reading.get("windows", []):
+        try:
+            resets = datetime.fromisoformat(str(w.get("resets_at")).replace("Z", "+00:00")).timestamp()
+        except Exception:
+            resets = None
+        if resets is None or resets > now:
+            kept.append(w)
+    return {"ok": True, "windows": kept, "stale": True} if kept else None
+
+
+def usage(label: str, state: dict, force: bool = False) -> dict:
+    cached = state.get(label)
+    # Only reuse real readings (and rate-limit errors, to keep backing off).
+    # Caching "not logged in" hid a slot for minutes after you logged it in.
+    reusable = cached and (cached.get("ok") or cached.get("error") == "HTTP 429")
+    if reusable and not force and time.time() - cached.get("at", 0) < POLL_FLOOR_S:
+        return cached
+    result = fetch_usage(label)
+    if not result.get("ok") and str(result.get("error", "")).startswith("idle"):
+        # Re-read even if the prompt failed: an exhausted account rejects it,
+        # but Claude Code has already refreshed the login by then.
+        keepalive(label, state)
+        result = fetch_usage(label)
+    if result.get("ok"):
+        state.setdefault("_last_good", {})[label] = result
+    else:
+        carried = still_limited(state.get("_last_good", {}).get(label) or {})
+        if carried:
+            carried["error"] = result.get("error")
+            result = carried
+    result["at"] = time.time()
+    state[label] = result
+    return result
+
+
+def worst_pct(u: dict) -> float | None:
+    if not u.get("ok"):
+        return None
+    vals = [w["pct"] for w in u.get("windows", []) if isinstance(w.get("pct"), (int, float))]
+    return max(vals) if vals else 0.0
+
+
+def tripped(u: dict, override: float | None = None) -> str | None:
+    """Name the first window at or over its threshold, or None."""
+    if not u.get("ok"):
+        return None
+    for w in u.get("windows", []):
+        pct = w.get("pct")
+        if not isinstance(pct, (int, float)):
+            continue
+        limit = override if override is not None else (
+            SESSION_SWITCH_AT if w["name"] == "session" else WEEKLY_SWITCH_AT)
+        if pct >= limit:
+            return f"{w['name']} {pct:.0f}%"
+    return None
+
+
+# ----------------------------------------------------------------- tokens
+
+def token_present(label: str) -> bool:
+    if label == "default" or platform.system() != "Darwin":
+        return False
+    r = subprocess.run(["security", "find-generic-password", "-s", TOKEN_SERVICE, "-a", label],
+                       capture_output=True, text=True, timeout=15)
+    return r.returncode == 0
+
+
+def store_token(label: str, token: str) -> None:
+    # `security -i` reads the command from stdin, so the token never appears in
+    # a process listing the way a -w argument would.
+    cmd = f'add-generic-password -U -s {TOKEN_SERVICE} -a {label} -w "{token}"\n'
+    r = subprocess.run(["security", "-i"], input=cmd, capture_output=True, text=True, timeout=30)
+    if r.returncode != 0 or not token_present(label):
+        sys.exit(f"could not save the token to the Keychain: {r.stderr.strip() or r.stdout.strip()}")
+
+
+def run_capturing(argv: list[str], env: dict) -> bytes:
+    """Run an interactive command in a wide pseudo-terminal and return its output.
+
+    Wide, so a long token is printed on one line instead of being wrapped.
+    """
+    import fcntl, pty, select, struct, termios, tty
+    captured = bytearray()
+    pid, fd = pty.fork()
+    if pid == 0:
+        os.execvpe(argv[0], argv, env)
+    fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 50, 1000, 0, 0))
+    stdin = sys.stdin.fileno()
+    old = termios.tcgetattr(stdin) if os.isatty(stdin) else None
+    try:
+        if old:
+            tty.setraw(stdin)
+        while True:
+            ready, _, _ = select.select([fd, stdin] if old else [fd], [], [])
+            if fd in ready:
+                try:
+                    data = os.read(fd, 4096)
+                except OSError:
+                    break
+                if not data:
+                    break
+                captured.extend(data)
+                os.write(sys.stdout.fileno(), data)
+            if old and stdin in ready:
+                data = os.read(stdin, 1024)
+                if data:
+                    os.write(fd, data)
+    finally:
+        if old:
+            termios.tcsetattr(stdin, termios.TCSADRAIN, old)
+        os.waitpid(pid, 0)
+    return bytes(captured)
+
+
+def set_toml_key(path: Path, key: str, value: str, comment: str) -> None:
+    """Set a top-level TOML string key (before the first [table]), with a backup."""
+    line = f'{key} = "{value}"'
+    text = path.read_text() if path.exists() else ""
+    if re.search(rf"^{re.escape(key)}\s*=", text, re.M):
+        text = re.sub(rf"^{re.escape(key)}\s*=.*$", line, text, flags=re.M)
+    else:
+        block = f"# {comment}\n{line}\n\n"
+        m = re.search(r"^\[", text, re.M)
+        text = text[:m.start()] + block + text[m.start():] if m else text + "\n" + block
+    if path.exists():
+        backup = path.with_name(path.name + f".bak-{time.strftime('%Y%m%d-%H%M%S')}")
+        shutil.copy2(path, backup)
+        print(f"backed up {backup}")
+    path.write_text(text)
+
+
+def remove_toml_key(path: Path, key: str) -> bool:
+    if not path.exists():
+        return False
+    text = path.read_text()
+    new = re.sub(rf"^# Added by claude-accounts[^\n]*\n(?={re.escape(key)}\s*=)", "", text, flags=re.M)
+    new = re.sub(rf"^{re.escape(key)}\s*=.*\n\n?", "", new, flags=re.M)
+    if new == text:
+        return False
+    backup = path.with_name(path.name + f".bak-{time.strftime('%Y%m%d-%H%M%S')}")
+    shutil.copy2(path, backup)
+    path.write_text(new)
+    return True
+
+
+# ---------------------------------------------------------------- gateway
+
+
+
+def log(msg: str) -> None:
+    ROOT.mkdir(mode=0o700, exist_ok=True)
+    with LOG_FILE.open("a") as f:
+        f.write(time.strftime("%Y-%m-%d %H:%M:%S ") + msg + "\n")
+
+
+# --------------------------------------------------------------- commands
+
+def cmd_add(args) -> int:
+    label = args.label
+    if label in ("default", "bin") or not re.fullmatch(r"[a-z0-9][a-z0-9_-]*", label):
+        sys.exit("label must be lowercase letters, digits, - or _, and not 'default' or 'bin'")
+    d = account_dir(label)
+    if d.exists():
+        print(f"{label} already exists at {d}")
+    else:
+        d.mkdir(mode=0o700, parents=True)
+        for entry in DEFAULT_DIR.iterdir():
+            if entry.name.startswith(PRIVATE_PREFIXES):
+                continue
+            (d / entry.name).symlink_to(entry)
+        # Carry over MCP servers, trusted projects and onboarding, minus the login.
+        src = HOME / ".claude.json"
+        dest = d / ".claude.json"
+        if src.is_file():
+            cfg = json.loads(src.read_text())
+            for key in ("oauthAccount", "userID", "primaryApiKey", "customApiKeyResponses"):
+                cfg.pop(key, None)
+            # Never write through a link into another account's file.
+            if dest.is_symlink():
+                dest.unlink()
+            fd = os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+            with os.fdopen(fd, "w") as f:
+                json.dump(cfg, f, indent=2)
+        print(f"created {d}")
+    print(f"next: claude-accounts login {label}")
+    return 0
+
+
+def cmd_login(args) -> int:
+    label = args.label
+    if label not in labels():
+        sys.exit(f"unknown account '{label}'. Run: claude-accounts add {label}")
+    env = claude_env(label)
+    env.pop("ANTHROPIC_API_KEY", None)  # subscription login, never API billing
+    print(f"Logging in account '{label}'. Pick the Claude account you want in this slot.")
+    return subprocess.call(["claude", "auth", "login"], env=env)
+
+
+def cmd_status(args) -> int:
+    state = load_state()
+    cur = active()
+    if args.json:
+        rows = []
+        for label in labels():
+            u = usage(label, state, force=args.refresh)
+            rows.append({"label": label, "active": label == cur, "identity": identity(label),
+                         "token": token_present(label), "usage": u})
+        save_state(state)
+        print(json.dumps({"active": cur, "accounts": rows}))
+        return 0
+    for label in labels():
+        u = usage(label, state, force=args.refresh)
+        mark = "*" if label == cur else " "
+        who = identity(label) or "(not logged in)"
+        if u.get("ok"):
+            parts = []
+            for w in u["windows"]:
+                pct = w.get("pct")
+                parts.append(f"{w['name']} {pct:.0f}%" if isinstance(pct, (int, float)) else w["name"])
+            detail = ", ".join(parts) or "no limits reported"
+        else:
+            detail = u.get("error", "unknown")
+        tok = "" if not conductor_wired() else (
+            "  " if label == "default" else ("T " if token_present(label) else "- "))
+        print(f"{mark} {tok}{label:<10} {who:<44} {detail}")
+    save_state(state)
+    if conductor_wired():
+        print("\n* = active   T = has a Conductor token   - = needs `claude-accounts token <label>`")
+    else:
+        print("\n* = active")
+    return 0
+
+
+CONDUCTOR_CLAUDE = "com.conductor.app/agent-binaries/claude/"
+
+
+def own_ancestors() -> set[int]:
+    pids, pid = set(), os.getpid()
+    while pid > 1 and pid not in pids:
+        pids.add(pid)
+        r = subprocess.run(["ps", "-o", "ppid=", "-p", str(pid)], capture_output=True, text=True)
+        pid = int(r.stdout.strip() or 1)
+    return pids
+
+
+def claude_runtimes() -> list[tuple[int, str]]:
+    """(pid, account label) for each Claude process CCodex or Conductor is running.
+
+    CCodex picks the account with CLAUDE_CONFIG_DIR, Conductor with
+    CLAUDE_CODE_OAUTH_TOKEN; both are fixed when the process starts, so a chat
+    that started before a switch stays on the old account. Neither set means
+    default. A Conductor token that matches no slot is skipped, as is the
+    Claude Code that is running this command. The CLI is never touched.
+    """
+    tokens = {}
+    for label in labels():
+        if label == "default" or platform.system() != "Darwin":
+            continue
+        r = subprocess.run(["security", "find-generic-password", "-s", TOKEN_SERVICE, "-a", label, "-w"],
+                           capture_output=True, text=True, timeout=15)
+        if r.returncode == 0 and r.stdout.strip():
+            tokens[r.stdout.strip()] = label
+    me = own_ancestors()
+    r = subprocess.run(["pgrep", "-f", "(claude-agent-sdk-[a-z0-9-]+|agent-binaries/claude/[^/]+)/claude "],
+                       capture_output=True, text=True)
+    out = []
+    for pid in (int(x) for x in r.stdout.split() if x.isdigit()):
+        if pid in me:
+            continue
+        # Sort by the binary itself: Conductor's environment also mentions .ccodex in PATH.
+        exe = subprocess.run(["ps", "-o", "comm=", "-p", str(pid)],
+                             capture_output=True, text=True).stdout
+        env = subprocess.run(["ps", "eww", "-o", "command=", "-p", str(pid)],
+                             capture_output=True, text=True).stdout
+        if "/.ccodex/" in exe:
+            m = re.search(r"CLAUDE_CONFIG_DIR=(\S+)", env)
+            label = Path(m.group(1)).name if m and m.group(1).startswith(str(ROOT)) else "default"
+        elif CONDUCTOR_CLAUDE in exe:
+            m = re.search(r"CLAUDE_CODE_OAUTH_TOKEN=(\S+)", env)
+            label = tokens.get(m.group(1)) if m else "default"
+            if label is None:
+                continue
+        else:
+            continue
+        out.append((pid, label))
+    return out
+
+
+def retire_runtimes(keep: str | None = None, only: set[str] | None = None) -> int:
+    """Close CCodex and Conductor Claude processes on accounts other than `keep`
+    (or, with `only`, on just those accounts).
+
+    Both apps treat these as disposable: the next turn in that chat starts a
+    fresh process through the wrapper, so on the active account, and resumes
+    the session from disk. GPT threads live in a separate process and are
+    untouched. Closing a process mid-turn ends that turn, which is why `auto`
+    only does it to accounts that are fully out of quota.
+    """
+    import signal
+    n = 0
+    for pid, label in claude_runtimes():
+        if label == keep or (only is not None and label not in only):
+            continue
+        try:
+            os.kill(pid, signal.SIGTERM)
+            n += 1
+        except ProcessLookupError:
+            pass
+    return n
+
+
+def exhausted(u: dict) -> bool:
+    """Every request fails: some window is at 100%, not just past the switch point."""
+    return any(isinstance(w.get("pct"), (int, float)) and w["pct"] >= 100
+               for w in u.get("windows", []) if u.get("ok"))
+
+
+def retire_exhausted(state: dict, keep: str) -> None:
+    """Close chats stuck on an account that is out of quota.
+
+    A chat keeps the account it started on, so after a switch its next message
+    still fails with "You've hit your weekly limit", and Retry fails the same
+    way. Every turn on an exhausted account fails anyway, so nothing is lost.
+    """
+    on = {label for _, label in claude_runtimes() if label != keep}
+    dead = {label for label in on if exhausted(usage(label, state))}
+    if dead:
+        n = retire_runtimes(only=dead)
+        log(f"closed {n} Claude chat process(es) stuck on exhausted {', '.join(sorted(dead))}")
+
+
+def switch(label: str, retire: bool, why: str) -> None:
+    ROOT.mkdir(mode=0o700, exist_ok=True)
+    ACTIVE_FILE.write_text(label + "\n")
+    log(f"active -> {label} ({why})")
+    if retire:
+        n = retire_runtimes(keep=label)
+        log(f"closed {n} Claude chat process(es) still on another account")
+
+
+def cmd_use(args) -> int:
+    if args.label not in labels():
+        sys.exit(f"unknown account '{args.label}'")
+    if not read_credentials(args.label):
+        sys.exit(f"'{args.label}' is not logged in. Run: claude-accounts login {args.label}")
+    switch(args.label, retire=args.now, why="manual")
+    print(f"active: {args.label} ({identity(args.label) or '?'})")
+    if not args.now:
+        print("New Claude turns use it; chats already running switch once they go idle.\n"
+              "Add --now to move running Claude chats immediately (interrupts their current turn).")
+    return 0
+
+
+def cmd_auto(args) -> int:
+    state = load_state()
+    cur = active()
+    cur_u = usage(cur, state, force=True)
+    why = tripped(cur_u, args.threshold)
+    if not why:
+        if not args.dry_run:
+            retire_exhausted(state, keep=cur)
+        save_state(state)
+        if args.verbose or args.dry_run:
+            detail = cur_u.get("error") if not cur_u.get("ok") else f"worst window {worst_pct(cur_u):.0f}%"
+            print(f"{cur}: fine ({detail}); no switch")
+        return 0
+
+    best, best_pct = None, None
+    for label in labels():
+        if label == cur or not read_credentials(label):
+            continue
+        u = usage(label, state)
+        if tripped(u, args.threshold):
+            continue
+        # A slot without a token can't serve Conductor, which would stay on the
+        # exhausted account; rank those last. Then known headroom beats unknown,
+        # and lower usage beats higher.
+        pct = worst_pct(u)
+        # Unknown usage ranks behind any known reading. The default account
+        # needs no token: Conductor uses ~/.claude for it directly.
+        rank = (pct if pct is not None else 95.0) + (
+            1000.0 if conductor_wired() and label != "default" and not token_present(label) else 0.0)
+        if best is None or rank < best_pct:
+            best, best_pct = label, rank
+    save_state(state)
+
+    if best is None:
+        if not args.dry_run:
+            log(f"{cur} at {why} and no other account has headroom; staying")
+        print(f"{cur} is at {why} and every other account is exhausted or logged out.")
+        return 2
+    if args.dry_run:
+        print(f"{cur} is at {why}: would switch to {best} ({identity(best) or '?'}, "
+              f"worst window {best_pct:.0f}%)")
+        return 0
+    # A live turn can still be using the old account. Killing its Claude process
+    # leaves the chat spinning until someone stops and retries that turn. Route
+    # new turns to the new account and let live turns finish; once the old
+    # account is fully out of quota, retire_exhausted closes what is left.
+    switch(best, retire=False, why=f"{cur} at {why}")
+    retire_exhausted(state, keep=best)
+    save_state(state)
+    print(f"switched {cur} -> {best} ({why})")
+    return 0
+
+
+AGENT_LABEL = "com.github.claude-accounts.auto"
+AGENT_PLIST = HOME / "Library" / "LaunchAgents" / f"{AGENT_LABEL}.plist"
+
+
+def install_agent(cli: Path) -> None:
+    """Run `auto` every 3 minutes, the usage endpoint's polling floor."""
+    AGENT_PLIST.parent.mkdir(parents=True, exist_ok=True)
+    # launchd starts with a bare PATH; give it the dirs Claude Code installs into.
+    dirs = []
+    found = shutil.which("claude")
+    if found:
+        dirs.append(str(Path(found).parent))
+    dirs += [f"{HOME}/.local/bin", f"{HOME}/.claude/local", f"{HOME}/.ccodex/bin",
+             "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"]
+    path = ":".join(dict.fromkeys(dirs))
+    AGENT_PLIST.write_text(f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>{AGENT_LABEL}</string>
+  <key>ProgramArguments</key><array>
+    <string>{sys.executable}</string><string>{cli}</string><string>auto</string>
+  </array>
+  <key>EnvironmentVariables</key><dict>
+    <key>PATH</key><string>{path}</string>
+  </dict>
+  <key>StartInterval</key><integer>180</integer>
+  <key>RunAtLoad</key><true/>
+  <key>StandardOutPath</key><string>{ROOT}/agent.out</string>
+  <key>StandardErrorPath</key><string>{ROOT}/agent.err</string>
+</dict></plist>
+""")
+    uid = os.getuid()
+    subprocess.run(["launchctl", "bootout", f"gui/{uid}/{AGENT_LABEL}"], capture_output=True)
+    r = subprocess.run(["launchctl", "bootstrap", f"gui/{uid}", str(AGENT_PLIST)],
+                       capture_output=True, text=True)
+    print(f"failover agent: {'loaded' if r.returncode == 0 else 'FAILED ' + r.stderr.strip()}")
+
+
+def cmd_install(args) -> int:
+    if platform.system() != "Darwin":
+        sys.exit("claude-accounts supports macOS only: it reads logins from the macOS Keychain.")
+    if not shutil.which("claude"):
+        sys.exit("Claude Code is not on PATH. Install it first: https://docs.anthropic.com/en/docs/claude-code")
+    ROOT.mkdir(mode=0o700, exist_ok=True)
+    WRAPPER.parent.mkdir(mode=0o700, exist_ok=True)
+    here = Path(__file__).resolve().parent
+    shutil.copy2(here / "claude-active", WRAPPER)
+    os.chmod(WRAPPER, 0o755)
+    if (here / "claude-conductor").resolve() != CONDUCTOR_WRAPPER.resolve():
+        shutil.copy2(here / "claude-conductor", CONDUCTOR_WRAPPER)
+    os.chmod(CONDUCTOR_WRAPPER, 0o755)
+    cli = WRAPPER.parent / "claude-accounts"
+    if Path(__file__).resolve() != cli.resolve():
+        shutil.copy2(Path(__file__).resolve(), cli)
+    os.chmod(cli, 0o755)
+    link = HOME / ".local" / "bin" / "claude-accounts"
+    link.parent.mkdir(parents=True, exist_ok=True)
+    if link.is_symlink() or not link.exists():
+        link.unlink(missing_ok=True)
+        link.symlink_to(cli)
+    if not ACTIVE_FILE.exists():
+        ACTIVE_FILE.write_text("default\n")
+    if not args.no_agent:
+        install_agent(cli)
+
+    print(f"installed {WRAPPER}")
+    if CCODEX_CONFIG.parent.is_dir():
+        set_toml_key(CCODEX_CONFIG, "claude_binary", str(WRAPPER),
+                     "Added by claude-accounts: run Claude through the account switcher.")
+        print(f"CCodex claude_binary -> {WRAPPER}")
+    print(f"\nFor the Claude Code CLI, add this to your shell profile:\n  alias claude='{WRAPPER}'")
+    if not os.environ.get("PATH", "").split(":").count(str(link.parent)):
+        print(f"\n{link.parent} is not on your PATH. Add it to run `claude-accounts` directly.")
+    return 0
+
+
+def cmd_uninstall(args) -> int:
+    uid = os.getuid()
+    subprocess.run(["launchctl", "bootout", f"gui/{uid}/{AGENT_LABEL}"], capture_output=True)
+    AGENT_PLIST.unlink(missing_ok=True)
+    print("failover agent removed")
+    if remove_toml_key(CCODEX_CONFIG, "claude_binary"):
+        print("CCodex is back to its own Claude")
+    if remove_toml_key(CONDUCTOR_SETTINGS, "claude_code_executable_path"):
+        print("Conductor is back to its own Claude")
+    link = HOME / ".local" / "bin" / "claude-accounts"
+    if link.is_symlink():
+        link.unlink()
+    for f in (WRAPPER, CONDUCTOR_WRAPPER, WRAPPER.parent / "claude-accounts"):
+        f.unlink(missing_ok=True)
+    print(f"removed the wrappers. Account slots and their logins are still in {ROOT};\n"
+          f"delete that folder and run `claude auth logout` in each slot to remove them too.\n"
+          f"Remove any `alias claude=...` line you added to your shell profile.")
+    return 0
+
+
+def cmd_token(args) -> int:
+    label = args.label
+    if label == "default":
+        sys.exit("the default account needs no token: Conductor already uses ~/.claude")
+    if label not in labels():
+        sys.exit(f"unknown account '{label}'")
+    who = identity(label)
+    print(f"Creating a Conductor token for '{label}'"
+          + (f" ({who})" if who else "") + ".")
+    print("Sign in to the SAME Claude account and organization as that slot.\n")
+    env = claude_env(label)
+    env.pop("ANTHROPIC_API_KEY", None)
+    out = run_capturing(["claude", "setup-token"], env)
+    plain = re.sub(rb"\x1b\[[0-9;?]*[ -/]*[@-~]", b"", out)
+    found = TOKEN_RE.findall(plain)
+    if found:
+        token = found[-1].decode()
+        print("\ncaptured the token from setup-token")
+    else:
+        import getpass
+        token = getpass.getpass("\nPaste the token setup-token printed (input hidden): ").strip()
+    if not TOKEN_RE.fullmatch(token.encode()):
+        sys.exit("that doesn't look like a Claude token (expected sk-ant-oat01-...); nothing saved")
+    store_token(label, token)
+    print(f"saved to Keychain ({TOKEN_SERVICE} / {label}). Conductor can now use '{label}'.")
+    return 0
+
+
+def conductor_wired() -> bool:
+    try:
+        text = CONDUCTOR_SETTINGS.read_text()
+    except FileNotFoundError:
+        return False
+    return str(CONDUCTOR_WRAPPER) in text
+
+
+def cmd_conductor(args) -> int:
+    if args.action == "off":
+        if remove_toml_key(CONDUCTOR_SETTINGS, "claude_code_executable_path"):
+            print("Conductor is back to its own Claude. New chats pick it up.")
+        else:
+            print("Conductor was not using claude-accounts.")
+        return 0
+    src = Path(__file__).resolve().parent / "claude-conductor"
+    if src.exists() and src.resolve() != CONDUCTOR_WRAPPER.resolve():
+        shutil.copy2(src, CONDUCTOR_WRAPPER)
+    if not CONDUCTOR_WRAPPER.exists():
+        sys.exit("Conductor wrapper not installed. Run `./claude-accounts install` from the repo first.")
+    os.chmod(CONDUCTOR_WRAPPER, 0o755)
+    r = subprocess.run([str(CONDUCTOR_WRAPPER), "--version"], capture_output=True, text=True, timeout=60)
+    if r.returncode != 0 or "Claude Code" not in r.stdout:
+        sys.exit(f"wrapper self-test failed; Conductor NOT changed:\n{r.stderr or r.stdout}")
+    print(f"wrapper ok: {r.stdout.strip()}")
+    set_toml_key(CONDUCTOR_SETTINGS, "claude_code_executable_path", str(CONDUCTOR_WRAPPER),
+                 "Added by claude-accounts: Conductor's Claude follows the active account.")
+    print("Conductor -> claude-accounts. New chats use the active account.\n"
+          "Undo any time: claude-accounts conductor off")
+    return 0
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(prog="claude-accounts", description=__doc__.split("\n")[0])
+    sub = p.add_subparsers(dest="cmd", required=True)
+    a = sub.add_parser("add"); a.add_argument("label"); a.set_defaults(fn=cmd_add)
+    a = sub.add_parser("login"); a.add_argument("label"); a.set_defaults(fn=cmd_login)
+    a = sub.add_parser("status"); a.add_argument("--refresh", action="store_true")
+    a.add_argument("--json", action="store_true"); a.set_defaults(fn=cmd_status)
+    a = sub.add_parser("use"); a.add_argument("label")
+    a.add_argument("--now", action="store_true", help="close running CCodex/Conductor Claude processes on other accounts")
+    a.add_argument("--no-restart", action="store_true", help=argparse.SUPPRESS)  # old flag, now the default
+    a.set_defaults(fn=cmd_use)
+    a = sub.add_parser("auto"); a.add_argument("-v", "--verbose", action="store_true")
+    a.add_argument("--dry-run", action="store_true", help="say what would happen; switch nothing")
+    a.add_argument("--threshold", type=float, help="override every window's switch percent (testing)")
+    a.set_defaults(fn=cmd_auto)
+    a = sub.add_parser("token"); a.add_argument("label"); a.set_defaults(fn=cmd_token)
+    a = sub.add_parser("conductor"); a.add_argument("action", choices=["on", "off"])
+    a.set_defaults(fn=cmd_conductor)
+    a = sub.add_parser("install"); a.add_argument("--no-agent", action="store_true")
+    a.set_defaults(fn=cmd_install)
+    a = sub.add_parser("uninstall"); a.set_defaults(fn=cmd_uninstall)
+    args = p.parse_args()
+    return args.fn(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
