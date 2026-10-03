@@ -92,7 +92,8 @@ def labels() -> list[str]:
     out = ["default"]
     if ROOT.is_dir():
         out += sorted(p.name for p in ROOT.iterdir()
-                      if p.is_dir() and p.name not in {"bin"} and not p.name.startswith("."))
+                      # Only valid labels: Claude Code briefly creates "<slot>.lock" dirs here.
+                      if p.is_dir() and p.name != "bin" and re.fullmatch(r"[a-z0-9][a-z0-9_-]*", p.name))
     return out
 
 
