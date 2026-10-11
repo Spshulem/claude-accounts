@@ -145,6 +145,9 @@ tail ~/.claude-accounts/auto.log             # what failover did and why
   CCodex's own pinned copy, so CCodex's version check still passes.
 - Conductor can fail over to a slot with a saved Conductor token even when that
   slot has no CLI login. A token being present does not prove that it has quota.
+- If the active account's quota cannot be read, automatic failover prefers an
+  account with fresh quota and headroom. Cached limits are marked in the menu;
+  the title shows `?` when the active account has no current quota reading.
 - A LaunchAgent runs `claude-accounts auto` every 3 minutes, the usage
   endpoint's polling floor. It switches when the active account reaches **90%
   of its 5-hour session** or **97% of any weekly limit**, choosing the account

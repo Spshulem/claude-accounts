@@ -193,7 +193,7 @@ def render(refresh: bool) -> None:
     active_worst = None
     if c:
         for a in c["accounts"]:
-            if a["active"] and a["usage"].get("ok"):
+            if a["active"] and a["usage"].get("ok") and not a["usage"].get("stale"):
                 vals = [w["pct"] for w in a["usage"]["windows"] if isinstance(w.get("pct"), (int, float))]
                 active_worst = max(vals) if vals else 0
         title_parts.append(f"✳ {active_worst:.0f}%" if active_worst is not None else "✳ ?")
@@ -222,7 +222,9 @@ def render(refresh: bool) -> None:
                 line(f"--{u.get('error', 'no data')}", color="#8e8e93")
             else:
                 worst = max([w["pct"] for w in u["windows"] if isinstance(w.get("pct"), (int, float))], default=0)
-                line(head, color=color(worst))
+                line(head, color="#8e8e93" if u.get("stale") else color(worst))
+                if u.get("stale"):
+                    line("   ⚠ Cached limits; current quota unavailable", color="#ff9f0a", size=11)
                 for w in u["windows"]:
                     name = {"session": "Session (5h)", "weekly": "Weekly"}.get(w["name"], w["name"].replace("weekly:", "Weekly · "))
                     reset = when(w.get("resets_at"))

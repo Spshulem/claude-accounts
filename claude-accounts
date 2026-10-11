@@ -648,7 +648,10 @@ def cmd_auto(args) -> int:
     cur = active()
     cur_u = usage(cur, state, force=True)
     why = tripped(cur_u, args.threshold)
-    if not why:
+    # A carried reading can lose its expired session window. Its remaining
+    # weekly percentage does not establish that the account can serve a turn.
+    require_fresh = not why and (not cur_u.get("ok") or cur_u.get("stale", False))
+    if not why and not require_fresh:
         if not args.dry_run:
             retire_exhausted(state, keep=cur)
         save_state(state)
@@ -657,6 +660,9 @@ def cmd_auto(args) -> int:
             print(f"{cur}: fine ({detail}); no switch")
         return 0
 
+    if require_fresh:
+        why = "quota unavailable"
+
     best, best_pct = None, None
     for label in labels():
         if label == cur or (not read_credentials(label) and not (conductor_wired() and token_present(label))):
@@ -664,10 +670,13 @@ def cmd_auto(args) -> int:
         u = usage(label, state)
         if tripped(u, args.threshold):
             continue
+        fresh = u.get("ok") and not u.get("stale")
+        if require_fresh and not fresh:
+            continue
         # A slot without a token can't serve Conductor, which would stay on the
         # exhausted account; rank those last. Then known headroom beats unknown,
         # and lower usage beats higher.
-        pct = worst_pct(u)
+        pct = worst_pct(u) if fresh else None
         # Unknown usage ranks behind any known reading. The default account
         # needs no token: Conductor uses ~/.claude for it directly.
         rank = (pct if pct is not None else 95.0) + (
@@ -679,7 +688,10 @@ def cmd_auto(args) -> int:
     if best is None:
         if not args.dry_run:
             log(f"{cur} at {why} and no other account has headroom; staying")
-        print(f"{cur} is at {why} and every other account is exhausted or logged out.")
+        if require_fresh:
+            print(f"{cur}: quota unavailable; no other account has fresh headroom; staying.")
+        else:
+            print(f"{cur} is at {why} and every other account is exhausted or logged out.")
         return 2
     if args.dry_run:
         print(f"{cur} is at {why}: would switch to {best} ({identity(best) or '?'}, "
