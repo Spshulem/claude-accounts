@@ -633,7 +633,7 @@ def switch(label: str, retire: bool, why: str) -> None:
 def cmd_use(args) -> int:
     if args.label not in labels():
         sys.exit(f"unknown account '{args.label}'")
-    if not read_credentials(args.label):
+    if not read_credentials(args.label) and not (conductor_wired() and token_present(args.label)):
         sys.exit(f"'{args.label}' is not logged in. Run: claude-accounts login {args.label}")
     switch(args.label, retire=args.now, why="manual")
     print(f"active: {args.label} ({identity(args.label) or '?'})")
@@ -659,7 +659,7 @@ def cmd_auto(args) -> int:
 
     best, best_pct = None, None
     for label in labels():
-        if label == cur or not read_credentials(label):
+        if label == cur or (not read_credentials(label) and not (conductor_wired() and token_present(label))):
             continue
         u = usage(label, state)
         if tripped(u, args.threshold):
@@ -813,14 +813,14 @@ def cmd_token(args) -> int:
     plain = re.sub(rb"\x1b\[[0-9;?]*[ -/]*[@-~]", b"", out)
     found = TOKEN_RE.findall(plain)
     if found:
-        token = found[-1].decode()
+        captured_token = found[-1].decode()
         print("\ncaptured the token from setup-token")
     else:
         import getpass
-        token = getpass.getpass("\nPaste the token setup-token printed (input hidden): ").strip()
-    if not TOKEN_RE.fullmatch(token.encode()):
+        captured_token = getpass.getpass("\nPaste the token setup-token printed (input hidden): ").strip()
+    if not TOKEN_RE.fullmatch(captured_token.encode()):
         sys.exit("that doesn't look like a Claude token (expected sk-ant-oat01-...); nothing saved")
-    store_token(label, token)
+    store_token(label, captured_token)
     print(f"saved to Keychain ({TOKEN_SERVICE} / {label}). Conductor can now use '{label}'.")
     return 0
 
