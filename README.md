@@ -158,7 +158,11 @@ tail ~/.claude-accounts/auto.log             # what failover did and why
   processes still on it, since every turn there fails anyway. The app resumes
   the chat from disk on the active account at the next message. Turns on an
   account that has only passed the switch point are left to finish. CLI
-  sessions are never closed.
+  sessions are never closed. If Conductor reports an explicit session or weekly
+  limit while quota readings are unavailable, `auto` also closes that failed
+  idle or waiting process on an old account. Retry keeps the chat history and
+  starts it on the selected account; working chats and selected-account
+  processes are preserved.
 
 The tool only reads tokens. It never refreshes, copies or proxies them; Claude
 Code refreshes each login itself when it is used.

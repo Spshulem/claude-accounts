@@ -607,18 +607,77 @@ def exhausted(u: dict) -> bool:
                for w in u.get("windows", []) if u.get("ok"))
 
 
-def retire_exhausted(state: dict, keep: str) -> None:
-    """Close chats stuck on an account that is out of quota.
+CONDUCTOR_DB = HOME / "Library" / "Application Support" / "com.conductor.app" / "conductor.db"
+SESSION_ARG_RE = re.compile(
+    r"(?:--session-id|--resume|-r)(?:=|\s+)([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})(?=\s|$)")
+QUOTA_ERROR_RE = re.compile(r"you[’']ve hit your (?:session|weekly) limit", re.IGNORECASE)
 
-    A chat keeps the account it started on, so after a switch its next message
-    still fails with "You've hit your weekly limit", and Retry fails the same
-    way. Every turn on an exhausted account fails anyway, so nothing is lost.
+
+def conductor_quota_failed(pid: int) -> bool:
+    """Read the latest result for an idle Conductor runtime; fail safely."""
+    import sqlite3
+    try:
+        exe = subprocess.run(["ps", "-o", "comm=", "-p", str(pid)],
+                             capture_output=True, text=True, timeout=5).stdout
+        if CONDUCTOR_CLAUDE not in exe:
+            return False
+        command = subprocess.run(["ps", "-o", "command=", "-p", str(pid)],
+                                 capture_output=True, text=True, timeout=5).stdout
+        match = SESSION_ARG_RE.search(command)
+        if not match:
+            return False
+        sid = match.group(1)
+        db = sqlite3.connect(CONDUCTOR_DB.as_uri() + "?mode=ro", uri=True, timeout=0.5)
+        try:
+            sessions = db.execute(
+                "SELECT id, status FROM sessions WHERE id = ? OR claude_session_id = ? LIMIT 2",
+                (sid, sid)).fetchall()
+            if len(sessions) != 1 or sessions[0][1] not in {"idle", "waiting"}:
+                return False
+            messages = db.execute(
+                "SELECT content FROM session_messages WHERE session_id = ? AND role = 'assistant' "
+                "ORDER BY created_at DESC, rowid DESC LIMIT 20", (sessions[0][0],))
+            for (content,) in messages:
+                try:
+                    msg = json.loads(content)
+                except (TypeError, ValueError):
+                    return False
+                if not isinstance(msg, dict):
+                    return False
+                if msg.get("type") != "result":
+                    continue
+                result = msg.get("result")
+                return (msg.get("is_error") is True and isinstance(result, str)
+                        and QUOTA_ERROR_RE.search(result) is not None)
+            return False
+        finally:
+            db.close()
+    except (OSError, subprocess.TimeoutExpired, sqlite3.Error):
+        return False
+
+
+def retire_exhausted(state: dict, keep: str) -> None:
+    """Close old-account runtimes with exhausted quota or a confirmed limit error.
+
+    Conductor fixes the account when a process starts. A failed idle runtime
+    must close before Retry can resume the same chat on the selected account.
+    Its explicit quota error is useful even when account usage is unavailable.
     """
-    on = {label for _, label in claude_runtimes() if label != keep}
-    dead = {label for label in on if exhausted(usage(label, state))}
-    if dead:
-        n = retire_runtimes(only=dead)
-        log(f"closed {n} Claude chat process(es) stuck on exhausted {', '.join(sorted(dead))}")
+    import signal
+    runtimes = [(pid, label) for pid, label in claude_runtimes() if label != keep]
+    dead = {label for _, label in runtimes if exhausted(usage(label, state))}
+    n, closed = 0, set()
+    for pid, label in runtimes:
+        if label not in dead and not conductor_quota_failed(pid):
+            continue
+        try:
+            os.kill(pid, signal.SIGTERM)
+            n += 1
+            closed.add(label)
+        except ProcessLookupError:
+            pass
+    if n:
+        log(f"closed {n} Claude chat process(es) stuck on exhausted {', '.join(sorted(closed))}")
 
 
 def switch(label: str, retire: bool, why: str) -> None:

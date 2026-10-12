@@ -1,5 +1,9 @@
 import contextlib
 import io
+import json
+import signal
+import sqlite3
+import tempfile
 import runpy
 import unittest
 from pathlib import Path
@@ -140,6 +144,114 @@ class MenuQuotaFreshnessTests(unittest.TestCase):
         lines = output.getvalue().splitlines()
         self.assertEqual(lines[0], '✳ ?')
         self.assertTrue(any('Cached limits; current quota unavailable' in line for line in lines))
+
+
+class ConductorRetirementTests(unittest.TestCase):
+    SID = '00000000-0000-0000-0000-000000000001'
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.db = Path(self.tmp.name) / 'conductor.db'
+        with contextlib.closing(sqlite3.connect(self.db, isolation_level=None)) as db:
+            db.execute('CREATE TABLE sessions (id TEXT, claude_session_id TEXT, status TEXT)')
+            db.execute('CREATE TABLE session_messages (session_id TEXT, role TEXT, content TEXT, created_at INTEGER)')
+            db.execute('INSERT INTO sessions VALUES (?, ?, ?)', (self.SID, self.SID, 'idle'))
+        fn = MODULE['conductor_quota_failed']
+        self.globals = fn.__globals__
+        self.mock_ps = unittest.mock.Mock(side_effect=lambda args, **kw: SimpleNamespace(
+            stdout=('com.conductor.app/agent-binaries/claude/mock/claude' if 'comm=' in args
+                    else 'claude --session-id ' + self.SID)))
+        patcher = patch.dict(self.globals, {'CONDUCTOR_DB': self.db})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        patcher = patch.object(self.globals['subprocess'], 'run', self.mock_ps)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def message(self, error=True, text="You've hit your session limit", kind='result', role='assistant'):
+        with contextlib.closing(sqlite3.connect(self.db, isolation_level=None)) as db:
+            db.execute('INSERT INTO session_messages VALUES (?, ?, ?, ?)',
+                       (self.SID, role, json.dumps({'type': kind, 'is_error': error, 'result': text}), 1))
+
+    def status(self, status):
+        with contextlib.closing(sqlite3.connect(self.db, isolation_level=None)) as db:
+            db.execute('UPDATE sessions SET status = ?', (status,))
+
+    def retire(self, runtimes):
+        kill = unittest.mock.Mock()
+        with patch.dict(self.globals, {
+            'claude_runtimes': lambda: runtimes,
+            'usage': lambda *args: {'ok': False, 'error': 'unavailable'},
+            'log': lambda msg: None,
+        }), patch.object(self.globals['os'], 'kill', kill):
+            MODULE['retire_exhausted']({}, keep='selected')
+        return kill
+
+    def test_idle_limit_error_retires_without_quota_reading(self):
+        self.message()
+        self.retire([(123, 'old')]).assert_called_once_with(123, signal.SIGTERM)
+
+    def test_waiting_weekly_error_retires(self):
+        self.status('waiting')
+        self.message(text='You’ve hit your weekly limit')
+        self.retire([(123, 'old')]).assert_called_once_with(123, signal.SIGTERM)
+
+    def test_selected_account_is_preserved(self):
+        self.message()
+        self.retire([(123, 'selected')]).assert_not_called()
+        self.mock_ps.assert_not_called()
+
+    def test_working_chat_is_preserved(self):
+        self.status('working')
+        self.message()
+        self.retire([(123, 'old')]).assert_not_called()
+
+    def test_successful_latest_result_is_preserved(self):
+        self.message()
+        self.message(error=False, text='Completed')
+        self.retire([(123, 'old')]).assert_not_called()
+
+    def test_unrelated_error_is_preserved(self):
+        self.message(text='Network unavailable')
+        self.retire([(123, 'old')]).assert_not_called()
+
+    def test_non_result_events_do_not_hide_quota_failure(self):
+        self.message()
+        self.message(kind='system', text='Metadata event')
+        self.retire([(123, 'old')]).assert_called_once_with(123, signal.SIGTERM)
+
+    def test_user_quoted_quota_message_is_not_evidence(self):
+        self.message(role='user')
+        self.retire([(123, 'old')]).assert_not_called()
+
+    def test_missing_database_is_safe_and_not_created(self):
+        self.db.unlink()
+        self.retire([(123, 'old')]).assert_not_called()
+        self.assertFalse(self.db.exists())
+
+    def test_corrupt_database_is_safe(self):
+        self.db.write_text('invalid database')
+        self.retire([(123, 'old')]).assert_not_called()
+
+    def test_unknown_session_is_safe(self):
+        with contextlib.closing(sqlite3.connect(self.db, isolation_level=None)) as db:
+            db.execute('DELETE FROM sessions')
+        self.message()
+        self.retire([(123, 'old')]).assert_not_called()
+
+    def test_non_conductor_process_is_preserved(self):
+        self.mock_ps.side_effect = None
+        self.mock_ps.return_value = SimpleNamespace(stdout='/mock/cli/claude')
+        self.message()
+        self.retire([(123, 'old')]).assert_not_called()
+
+    def test_malformed_latest_message_is_safe(self):
+        self.message()
+        with contextlib.closing(sqlite3.connect(self.db, isolation_level=None)) as db:
+            db.execute('INSERT INTO session_messages VALUES (?, ?, ?, ?)',
+                       (self.SID, 'assistant', 'not JSON', 2))
+        self.retire([(123, 'old')]).assert_not_called()
 
 if __name__ == '__main__':
     unittest.main()
